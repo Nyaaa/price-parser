@@ -7,6 +7,8 @@ import aiohttp
 import time
 import coloredlogs
 import logging
+import re
+import unicodedata
 
 load_dotenv(find_dotenv())
 logger = logging.getLogger(__name__)
@@ -16,6 +18,8 @@ coloredlogs.install(level='DEBUG')
 class Parser:
     def __init__(self):
         self.URL = os.getenv('URL')
+        if self.URL is None:
+            raise EnvironmentError('URL not specified')
         self.data = {}
         self.done = []
         self.session = None
@@ -29,9 +33,12 @@ class Parser:
         await self.add_tasks(links)
 
     async def fetch(self, url):
-        async with self.session.get(url) as response:
-            logging.debug(f'Fetching page {url}...')
-            return await response.text()
+        async with self.session.get(url, ssl=False) as response:
+            logger.debug(f'>>> Fetching page {url}')
+            try:
+                return await response.text()
+            except aiohttp.ClientPayloadError:
+                return await response.text()
 
     async def scrape(self, category):
         if category in self.done:
@@ -39,7 +46,7 @@ class Parser:
         page = f'{self.URL}{category}?product_all=1'
         self.done.append(category)
         response_text = await self.fetch(page)
-        logging.debug(f'Fetched page {page}')
+        logger.debug(f'<<< Fetched page {page}')
         soup = BeautifulSoup(response_text, 'lxml')
         cards = soup.find_all('div', attrs={'class': 'pad'})
         cats = soup.find_all('div', attrs={'class': 'category'})
@@ -52,15 +59,18 @@ class Parser:
             cat_data = {title: {}}
             for card in cards:
                 article = card.find('div', attrs={'class': 'art'}).get_text().split(' ', 1)[1]
-                price = card.find('div', attrs={'class': 'price'}).get_text().encode('ascii', 'ignore')
+                price = card.find('div', attrs={'class': re.compile(r'^price')}).get_text()
+                price = unicodedata.normalize('NFKD', price).replace(' ', '')
                 cat_data[title][article] = float(price)
             self.data.update(cat_data)
-            logging.info(f'Parsed {category}')
+            logger.info(f'Parsed {category}')
 
     async def add_tasks(self, links):
-        tasks = {self.scrape(cat) for cat in links if cat not in self.done}
-        await asyncio.gather(*tasks)
-        logging.debug(f'Added links: {links}')
+        links = {cat for cat in links if cat not in self.done}
+        tasks = [self.scrape(link) for link in links]
+        if tasks:
+            await asyncio.gather(*tasks)
+            logger.debug(f'Added links: {links}')
 
     async def main(self):
         async with aiohttp.ClientSession() as session:
@@ -79,6 +89,7 @@ class Parser:
     def export(self):
         with open('output.csv', 'w', newline='', encoding='utf-8') as csv_file:
             csvwriter = csv.writer(csv_file)
+            csvwriter.writerow(['category', 'article', 'price'])
             for cat in self.data:
                 for item in self.data[cat]:
                     csvwriter.writerow([cat, item, self.data[cat][item]])
